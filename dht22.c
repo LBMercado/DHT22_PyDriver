@@ -8,10 +8,32 @@
 
 #include <stdio.h>
 #include <wiringPi.h>
+#include "dht22.h"
+#define FALLBACK_PIN 6
+/*
+  use positive values to denote accepted results, negative otherwise
+*/
+static STATUS status;
 
-static const unsigned short signal = 18;
+static unsigned short signal;
+static float temp, hum;
 unsigned short data[5] = {0, 0, 0, 0, 0};
 
+/*
+	param /pin/ - the WiringPi representation of the board's pin as seen in the 'gpio readall' command
+*/
+void setup(unsigned short pin)
+{
+	signal = pin;
+	
+	// GPIO Initialization
+	if (wiringPiSetup() == -1)
+	{
+		printf("[x_x] GPIO Initialization FAILED.\n");
+		status = INIT_ERR;
+	}
+	status = INIT;
+}
 
 short readData()
 {
@@ -29,7 +51,7 @@ short readData()
 
 			// When sending data ends, high signal occur infinite.
 			// So we have to end this infinite loop.
-			if (signal_length >= 200)
+			if (signal_length >= MAX_HIGH_SIGNAL_LENGTH)
 			{
 				return -1;
 			}
@@ -94,76 +116,105 @@ short readData()
 	}
 }
 
-
-int main(void)
-{
+void read(){
 	float humidity;
 	float celsius;
-	float fahrenheit;
 	short checksum;
-
-	// GPIO Initialization
-	if (wiringPiSetupGpio() == -1)
-	{
-		printf("[x_x] GPIO Initialization FAILED.\n");
-		return -1;
+	
+	if (status == INIT_ERR){
+		printf("initialization failed, cannot read sensor.");
+		return;
 	}
+	
+	if (status == BUSY){
+		printf("sensor is busy");
+		return;
+	}
+	status = BUSY;
+	pinMode(signal, OUTPUT);
 
-	for (unsigned char i = 0; i < 10; i++)
+	// Send out start signal
+	digitalWrite(signal, LOW);
+	delay(AWAKE_TIME_MS);	// Stay LOW for 5~30 milliseconds
+	pinMode(signal, INPUT);		// 'INPUT' equals 'HIGH' level. And signal read mode
+
+	readData();		// Read DHT22 signal
+
+	// The sum is maybe over 8 bit like this: '0001 0101 1010'.
+	// Remove the '9 bit' data using AND operator.
+	checksum = (data[0] + data[1] + data[2] + data[3]) & 0xFF;
+
+	// If Check-sum data is correct (NOT 0x00), display humidity and temperature
+	if (data[4] == checksum && checksum != 0x00)
 	{
-		pinMode(signal, OUTPUT);
+		// * 256 is the same thing '<< 8' (shift).
+		humidity = ((data[0] * 256) + data[1]) / 10.0;
+		
+		// found that with the original code at temperatures > 25.4 degrees celsius
+		// the temperature would print 0.0 and increase further from there.
+		// Eventually when the actual temperature drops below 25.4 again
+		// it would print the temperature as expected.
+		// Some research and comparisin with other C implementation suggest a
+		// different calculation of celsius.
+		//celsius = data[3] / 10.0; //original
+		celsius = (((data[2] & 0x7F)*256) + data[3]) / 10.0; //Juergen Wolf-Hofer
 
-		// Send out start signal
-		digitalWrite(signal, LOW);
-		delay(20);					// Stay LOW for 5~30 milliseconds
-		pinMode(signal, INPUT);		// 'INPUT' equals 'HIGH' level. And signal read mode
-
-		readData();		// Read DHT22 signal
-
-		// The sum is maybe over 8 bit like this: '0001 0101 1010'.
-		// Remove the '9 bit' data using AND operator.
-		checksum = (data[0] + data[1] + data[2] + data[3]) & 0xFF;
-
-		// If Check-sum data is correct (NOT 0x00), display humidity and temperature
-		if (data[4] == checksum && checksum != 0x00)
+		// If 'data[2]' data like 1000 0000, It means minus temperature
+		if (data[2] == 0x80)
 		{
-			// * 256 is the same thing '<< 8' (shift).
-			humidity = ((data[0] * 256) + data[1]) / 10.0;
-			
-			// found that with the original code at temperatures > 25.4 degrees celsius
-			// the temperature would print 0.0 and increase further from there.
-			// Eventually when the actual temperature drops below 25.4 again
-			// it would print the temperature as expected.
-			// Some research and comparisin with other C implementation suggest a
-			// different calculation of celsius.
-			//celsius = data[3] / 10.0; //original
-			celsius = (((data[2] & 0x7F)*256) + data[3]) / 10.0; //Juergen Wolf-Hofer
-
-			// If 'data[2]' data like 1000 0000, It means minus temperature
-			if (data[2] == 0x80)
-			{
-				celsius *= -1;
-			}
-
-			fahrenheit = ((celsius * 9) / 5) + 32;
-
-			// Display all data
-			printf("TEMP: %6.2f *C (%6.2f *F) | HUMI: %6.2f %\n\n", celsius, fahrenheit, humidity);
-			return 0;
+			celsius *= -1;
 		}
 
-		else
-		{
-			printf("[x_x] Invalid Data. Try again.\n\n");
-		}
-
+		temp = celsius;
+		hum = humidity;
+		
 		// Initialize data array for next loop
 		for (unsigned char i = 0; i < 5; i++)
 		{
 			data[i] = 0;
 		}
+		status = OK;
+	} else {
+		// Initialize data array for next loop
+		for (unsigned char i = 0; i < 5; i++)
+		{
+			data[i] = 0;
+		}
+		status = ERR;
+	}
+}
 
-		delay(2000);	// DHT22 average sensing period is 2 seconds
+float getTemperature(){
+	return temp;
+}
+
+float getHumidity(){
+	return hum;
+}
+
+int main(void)
+{
+	float fahrenheit;
+	short checksum;
+
+	setup(FALLBACK_PIN);
+
+	for (unsigned char i = 0; i < 10; i++)
+	{
+		read();
+
+		// Display all data
+		if (status == OK){
+			fahrenheit = ((temp * 9) / 5) + 32;
+			printf("TEMP: %6.2f *C (%6.2f *F) | HUMI: %6.2f \n\n", temp, fahrenheit, hum);
+		} else if (status == INIT_ERR){
+			printf("[x_x] Initialization failed, check config.\n\n");
+		}
+		else {
+			printf("[x_x] Invalid Data. Try again.\n\n");
+		}
+
+		delay(DHT_DELAY_MS);	// DHT22 average sensing period is 2 seconds
 	}
 
 	return 0;
